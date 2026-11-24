@@ -26,6 +26,24 @@ pub struct SimulationConfig {
     pub mecanum: MecanumConfig,
     pub projectile: ProjectileConfig,
     pub camera: CameraConfig,
+    #[serde(default)]
+    pub patrol: PatrolConfig,
+}
+
+#[derive(Deserialize, Reflect, Clone)]
+#[serde(default)]
+pub struct PatrolConfig {
+    pub span_m: f32,
+    pub speed_mps: f32,
+}
+
+impl Default for PatrolConfig {
+    fn default() -> Self {
+        Self {
+            span_m: 5.0,
+            speed_mps: 1.0,
+        }
+    }
 }
 
 #[derive(Deserialize, Reflect, Clone)]
@@ -358,6 +376,7 @@ impl Default for SimulationConfig {
                 render: RenderConfig::default(),
                 capture: CapturePipelineConfig::default(),
                 livox_ros: LivoxRosConfig::default(),
+                patrol: PatrolConfig::default(),
                 physics: PhysicsConfig::default(),
                 vehicle: VehicleConfig::default(),
                 mecanum: MecanumConfig::default(),

@@ -2,7 +2,8 @@ use crate::arc_mutex;
 use crate::capture::CaptureSource;
 use crate::capture::driver::{CaptureConfig, CapturedFrameKind};
 use crate::components::{
-    Controlled, InfantryChassis, InfantryGimbal, InfantryLaunchOffset, SubscribeAutoAim,
+    CameraMode, Controlled, FollowingType, InfantryChassis, InfantryGimbal, InfantryLaunchOffset,
+    SubscribeAutoAim,
 };
 use crate::config::SimulationConfig;
 use crate::robomaster::prelude::{ArmorRoot, PowerRune, RuneIndex, TechCore, tech_core_state_json};
@@ -16,8 +17,11 @@ use crate::util::entity_query::HierarchyQuery;
 use bevy::ecs::system::RunSystemOnce;
 use bevy::prelude::*;
 use bevy::render::render_resource::TextureFormat;
+use bevy::time::Real;
 use r2r::ClockType::SystemTime;
-use r2r::geometry_msgs::msg::{Point, Pose, Vector3};
+use r2r::geometry_msgs::msg::{Point, Pose, PoseStamped, Vector3};
+use r2r::rm_interfaces::msg::GimbalCmd;
+use r2r::sensor_msgs::msg::JointState;
 use r2r::std_msgs::msg::{ColorRGBA, String as RosString};
 use r2r::visualization_msgs::msg::Marker;
 use r2r::{Clock, Context, Node, std_msgs::msg::Header, tf2_msgs::msg::TFMessage};
@@ -52,6 +56,8 @@ struct FireRateLimiter(AverageRateLimiter);
 
 #[derive(Resource, Deref, DerefMut)]
 struct TechCoreStateRateLimiter(AverageRateLimiter);
+
+const SIM_GIMBAL_TIMEOUT: Duration = Duration::from_secs(1);
 
 macro_rules! tf_tree {
     (stamp: $stamp:expr;$root:literal { $($content:tt)* }) => {{
@@ -140,6 +146,14 @@ fn capture_rune(
     let gimbal = gimbal.into_inner();
     let cam_rel = cam_transform.reparented_to(gimbal);
     let muzzle_rel = muzzle_offset.0.reparented_to(gimbal);
+    let gimbal_rotation = gimbal.rotation()
+        * muzzle_offset.1.rotation
+        * Quat::from_euler(EulerRot::ZYX, 0.0, 0.0, PI / 2.0);
+    let gimbal_pose = transform(
+        Transform::IDENTITY
+            .with_translation(gimbal.translation())
+            .with_rotation(gimbal_rotation),
+    );
 
     // Avoid per-frame `info!` logging (it will cap FPS under ROS2 builds).
     debug!(
@@ -171,15 +185,21 @@ fn capture_rune(
             map
         },
     );
+    let armor_frames: Vec<_> = armor
+        .iter()
+        .filter_map(|(entity, transform, armor)| {
+            let center_entity = qq.of(entity).suffix("CENTER").any().one()?;
+            let (_, center_transform) = center.get(center_entity).ok()?;
+            Some((center_transform.compute_transform(), transform.rotation(), armor))
+        })
+        .collect();
+    let armor_transforms = &armor_frames;
 
     debug!(
         "[ROS2] MUZZLE pos: [{:.4}, {:.4}, {:.4}]",
         muzzle_rel.translation.x, muzzle_rel.translation.y, muzzle_rel.translation.z
     );
-    let rot = (gimbal.rotation()
-        * muzzle_offset.1.rotation
-        * Quat::from_euler(EulerRot::ZYX, 0.0, 0.0, PI / 2.0))
-    .to_euler(EulerRot::ZXY);
+    let rot = gimbal_rotation.to_euler(EulerRot::ZXY);
     debug!(
         "[ROS2] GIMBAL rpy: [{:.4}, {:.4}, {:.4}]",
         rot.0.to_degrees(),
@@ -187,12 +207,13 @@ fn capture_rune(
         rot.2.to_degrees()
     );
 
+    let stamp = Clock::to_builtin_time(&res_unwrap!(clock).get_now().unwrap());
     let transform_stamped = tf_tree! {
-        stamp: Clock::to_builtin_time(&res_unwrap!(clock).get_now().unwrap());
+        stamp: stamp;
 
         "map" {
             "odom" as (gimbal.translation(), Quat::IDENTITY) for odom_pose_pub {
-                "gimbal_link" as (Vec3::ZERO, gimbal.rotation() * muzzle_offset.1.rotation * Quat::from_euler(EulerRot::ZYX, 0.0, 0.0, PI / 2.0)) for gimbal_pose_pub {
+                "gimbal_link" as (Vec3::ZERO, gimbal_rotation) {
                     "muzzle" as (muzzle_rel.translation, Quat::IDENTITY) {
                         "muzzle_link" as (Vec3::ZERO, Quat::IDENTITY) for muzzle_pose_pub{}
                     }
@@ -210,24 +231,18 @@ fn capture_rune(
                     pub name as (tf.translation, tf.rotation);
                 }
             }
-            for (entity, _transform, armor) in armor {
+            for (tf, _rotation, armor) in armor_transforms {
                 let name = format!("armor_{:?}", armor.id.as_usize())
                     .to_string()
                     .to_lowercase();
-                let tf = center.get(qq.of(entity).suffix("CENTER").any().one().unwrap()).unwrap().1.compute_transform();
                 pub name as (tf.translation, tf.rotation);
             }
         }
     };
 
     let stamp = Clock::to_builtin_time(&res_unwrap!(clock).get_now().unwrap());
-    for (entity, tf, armor) in armor {
-        let mut tff = center
-            .get(qq.of(entity).suffix("CENTER").any().one().unwrap())
-            .unwrap()
-            .1
-            .compute_transform();
-        tff.rotation = tf.rotation() * Quat::from_euler(EulerRot::ZYX, 0.0, 0.0, -PI / 2.0);
+    for (mut tff, rotation, armor) in armor_frames {
+        tff.rotation = rotation * Quat::from_euler(EulerRot::ZYX, 0.0, 0.0, -PI / 2.0);
         let tf = transform(tff);
         marker_pub.publish(Marker {
             header: Header {
@@ -278,13 +293,60 @@ fn capture_rune(
     tf_publisher.publish(TFMessage {
         transforms: transform_stamped,
     });
+    gimbal_pose_pub.publish(PoseStamped {
+        header: Header {
+            stamp,
+            frame_id: "map".to_string(),
+        },
+        pose: Pose {
+            position: Point {
+                x: gimbal_pose.translation.x,
+                y: gimbal_pose.translation.y,
+                z: gimbal_pose.translation.z,
+            },
+            orientation: gimbal_pose.rotation,
+        },
+    });
+}
+
+fn decode_sim_setpoint(msg: &JointState) -> Result<Option<GimbalAimTarget>, ()> {
+    if msg.header.frame_id != "map" {
+        return Err(());
+    }
+    if !msg.velocity.is_empty() || !msg.effort.is_empty() {
+        return Err(());
+    }
+    let (yaw, pitch) = match (msg.name.as_slice(), msg.position.as_slice()) {
+        ([], []) => return Ok(None),
+        ([first, second], [a, b]) => match (first.as_str(), second.as_str()) {
+            ("yaw", "pitch") => (*a as f32, *b as f32),
+            ("pitch", "yaw") => (*b as f32, *a as f32),
+            _ => return Err(()),
+        },
+        _ => return Err(()),
+    };
+    if !yaw.is_finite() || !pitch.is_finite() {
+        return Err(());
+    }
+
+    // EGAIM sends absolute map angles. Yaw uses the same map convention; its
+    // positive-down pitch is opposite Bevy's positive-up target pitch.
+    Ok(Some(GimbalAimTarget {
+        yaw,
+        pitch: -pitch,
+    }))
 }
 
 fn process_subscription(
     time: Res<Time>,
+    real_time: Res<Time<Real>>,
+    camera_mode: Res<CameraMode>,
     mut commands: Commands,
     gimbal_cmd: ResMut<TopicSubscriber<GimbalCmdTopic>>,
+    sim_gimbal_cmd: Res<TopicSubscriber<SimGimbalCmdTopic>>,
+    sim_setpoint: Res<TopicSubscriber<SimGimbalSetpointTopic>>,
     mut fire_rate_limiter: ResMut<FireRateLimiter>,
+    mut sim_target_expires: Local<Option<Duration>>,
     gimbal: Single<
         (Entity, Option<&mut GimbalAimTracker>),
         (
@@ -297,16 +359,46 @@ fn process_subscription(
 ) {
     let (gimbal_entity, mut tracker) = gimbal.into_inner();
     fire_rate_limiter.tick(time.delta());
+    let legacy_target = |cmd: &GimbalCmd| {
+        (cmd.distance != -1.0)
+            .then(|| GimbalAimTarget::from_solver_degrees(cmd.yaw as f32, cmd.pitch as f32))
+    };
     loop {
-        let Ok(Some(cmd)) = gimbal_cmd.try_recv() else {
+        let next = match gimbal_cmd.try_recv() {
+            Ok(Some(cmd)) => Some((legacy_target(&cmd), false, cmd.fire_advice, false)),
+            _ => {
+                let setpoint = sim_setpoint.try_recv().ok().flatten();
+                let legacy = sim_gimbal_cmd.try_recv().ok().flatten();
+                if camera_mode.0 == FollowingType::Robot {
+                    setpoint
+                        .and_then(|msg| decode_sim_setpoint(&msg).ok())
+                        .map(|target| (target, true, false, true))
+                        .or_else(|| {
+                            legacy
+                                .as_ref()
+                                .map(|cmd| (legacy_target(cmd), true, false, false))
+                        })
+                } else {
+                    None
+                }
+            }
+        };
+        let Some((target, is_simulator, fire, use_muzzle_forward)) = next else {
+            if sim_target_expires.is_some_and(|deadline| {
+                camera_mode.0 != FollowingType::Robot || real_time.elapsed() >= deadline
+            }) {
+                commands.entity(gimbal_entity).remove::<GimbalAimTracker>();
+                *sim_target_expires = None;
+            }
             return;
         };
-        // No solution from the solver: drop the target so the PID loop stops driving.
-        if cmd.distance == -1.0 {
+        let Some(target) = target else {
+            *sim_target_expires = None;
             commands.entity(gimbal_entity).remove::<GimbalAimTracker>();
             return;
-        }
-        if cmd.fire_advice {
+        };
+        *sim_target_expires = is_simulator.then(|| real_time.elapsed() + SIM_GIMBAL_TIMEOUT);
+        if fire {
             if fire_rate_limiter.allow() {
                 commands.queue(|w: &mut World| {
                     w.run_system_once(projectile_launch).unwrap();
@@ -314,13 +406,19 @@ fn process_subscription(
             }
         }
 
-        let target = GimbalAimTarget::from_solver_degrees(cmd.yaw as f32, cmd.pitch as f32);
+        let retarget = |tracker: &mut GimbalAimTracker| {
+            if use_muzzle_forward {
+                tracker.retarget_muzzle_forward(target);
+            } else {
+                tracker.retarget(target);
+            }
+        };
         match tracker.as_mut() {
-            Some(tracker) => tracker.retarget(target),
+            Some(tracker) => retarget(tracker),
             None => {
-                commands
-                    .entity(gimbal_entity)
-                    .insert(GimbalAimTracker::new(target));
+                let mut tracker = GimbalAimTracker::new(target);
+                retarget(&mut tracker);
+                commands.entity(gimbal_entity).insert(tracker);
             }
         }
     }
@@ -347,6 +445,110 @@ fn publish_tech_core_state(
             cores.iter(),
         ),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn simulator_command_updates_and_clears_gimbal_target() {
+        let mut app = App::new();
+        app.insert_resource(Time::<()>::default())
+            .insert_resource(Time::<Real>::default())
+            .init_resource::<CameraMode>()
+            .insert_resource(TopicSubscriber::<GimbalCmdTopic>::new())
+            .insert_resource(TopicSubscriber::<SimGimbalCmdTopic>::new())
+            .insert_resource(TopicSubscriber::<SimGimbalSetpointTopic>::new())
+            .insert_resource(FireRateLimiter(AverageRateLimiter::from_hz(10.0)))
+            .add_systems(Update, process_subscription);
+        let gimbal = app
+            .world_mut()
+            .spawn((Controlled, InfantryGimbal::default()))
+            .id();
+        let cmd = GimbalCmd {
+            yaw: 20.0,
+            pitch: -6.0,
+            distance: 2.0,
+            fire_advice: true,
+            ..default()
+        };
+        app.world()
+            .resource::<TopicSubscriber<SimGimbalCmdTopic>>()
+            .inject(cmd.clone());
+        app.update();
+
+        let tracker = app.world().get::<GimbalAimTracker>(gimbal).unwrap();
+        assert_eq!(
+            tracker.target(),
+            GimbalAimTarget::from_solver_degrees(20.0, -6.0)
+        );
+        assert!(app.world_mut().resource_mut::<FireRateLimiter>().allow());
+
+        let setpoint = JointState {
+            header: Header {
+                frame_id: "map".into(),
+                ..default()
+            },
+            name: vec!["pitch".into(), "yaw".into()],
+            position: vec![0.25, 0.5],
+            ..default()
+        };
+        app.world()
+            .resource::<TopicSubscriber<SimGimbalSetpointTopic>>()
+            .inject(setpoint.clone());
+        app.update();
+        let target = app.world().get::<GimbalAimTracker>(gimbal).unwrap().target();
+        assert!((target.yaw - 0.5).abs() < 1e-6);
+        assert!((target.pitch + 0.25).abs() < 1e-6);
+
+        app.world()
+            .resource::<TopicSubscriber<SimGimbalSetpointTopic>>()
+            .inject(JointState {
+                header: Header {
+                    frame_id: "map".into(),
+                    ..default()
+                },
+                ..default()
+            });
+        app.update();
+        assert!(app.world().get::<GimbalAimTracker>(gimbal).is_none());
+
+        app.world()
+            .resource::<TopicSubscriber<SimGimbalSetpointTopic>>()
+            .inject(setpoint.clone());
+        app.update();
+        app.world_mut()
+            .resource_mut::<Time<Real>>()
+            .advance_by(SIM_GIMBAL_TIMEOUT - Duration::from_millis(1));
+        app.update();
+        assert!(app.world().get::<GimbalAimTracker>(gimbal).is_some());
+
+        app.world()
+            .resource::<TopicSubscriber<SimGimbalSetpointTopic>>()
+            .inject(JointState {
+                position: vec![f64::NAN, 0.5],
+                ..setpoint
+            });
+        app.world_mut()
+            .resource_mut::<Time<Real>>()
+            .advance_by(Duration::from_millis(1));
+        app.update();
+        assert!(app.world().get::<GimbalAimTracker>(gimbal).is_none());
+
+        app.world()
+            .resource::<TopicSubscriber<SimGimbalCmdTopic>>()
+            .inject(cmd.clone());
+        app.update();
+        assert!(app.world().get::<GimbalAimTracker>(gimbal).is_some());
+
+        app.world_mut().resource_mut::<CameraMode>().0 = FollowingType::Free;
+        app.world()
+            .resource::<TopicSubscriber<SimGimbalCmdTopic>>()
+            .inject(cmd);
+        app.update();
+        assert!(app.world().get::<GimbalAimTracker>(gimbal).is_none());
+    }
 }
 
 fn cleanup_ros2_system(
@@ -386,6 +588,10 @@ impl Plugin for ROS2Plugin {
             .world_mut()
             .remove_resource::<TopicPublisher<CameraInfoTopic>>()
             .unwrap();
+        let capture_pose = app
+            .world_mut()
+            .remove_resource::<TopicPublisher<CapturePoseTopic>>()
+            .unwrap();
         let image_raw = app
             .world_mut()
             .remove_resource::<TopicPublisher<ImageRawTopic>>()
@@ -404,7 +610,7 @@ impl Plugin for ROS2Plugin {
         let color_capture_config = CaptureConfig {
             width: sim_config.capture.color.width,
             height: sim_config.capture.color.height,
-            texture_format: TextureFormat::bevy_default(),
+            texture_format: TextureFormat::Rgba8UnormSrgb,
             frame_kind: CapturedFrameKind::Rgb8,
         };
         let depth_capture_config = CaptureConfig {
@@ -421,17 +627,6 @@ impl Plugin for ROS2Plugin {
             .insert_resource(StopSignal(signal_arc.clone()))
             .insert_resource(FireRateLimiter(AverageRateLimiter::from_hz(10.0)))
             .insert_resource(TechCoreStateRateLimiter(AverageRateLimiter::from_hz(20.0)))
-            .add_plugins(RosCapturePlugin {
-                config: color_capture_config,
-                context: RosCaptureContext {
-                    clock: clock.clone(),
-                    fov_y,
-                    publish_compressed: false,
-                    camera_info,
-                    image_raw,
-                    image_compressed,
-                },
-            })
             .add_systems(Last, cleanup_ros2_system)
             .add_systems(
                 Update,
@@ -445,6 +640,25 @@ impl Plugin for ROS2Plugin {
                     node.spin_once(Duration::from_millis(1));
                 }
             }))));
+
+        #[cfg(feature = "talos")]
+        let talos_local = crate::use_talos_local_capture();
+        #[cfg(not(feature = "talos"))]
+        let talos_local = false;
+        if !talos_local {
+            app.add_plugins(RosCapturePlugin {
+                config: color_capture_config,
+                context: RosCaptureContext {
+                    clock: clock.clone(),
+                    fov_y,
+                    publish_compressed: false,
+                    camera_info,
+                    capture_pose,
+                    image_raw,
+                    image_compressed,
+                },
+            });
+        }
 
         if sim_config.livox_ros.enabled {
             app.add_plugins(RosLivoxPlugin {

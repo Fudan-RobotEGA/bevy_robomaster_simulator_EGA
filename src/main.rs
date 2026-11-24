@@ -92,7 +92,7 @@ fn fixed_time_from_config(config: &SimulationConfig) -> Time<Fixed> {
 #[cfg(feature = "talos")]
 fn should_enable_talos_plugin(_app: &App) -> bool {
     #[cfg(feature = "ros2")]
-    let ros_capture_active = app
+    let ros_capture_active = _app
         .world()
         .contains_resource::<crate::ros2::capture::RosCaptureContext>();
     #[cfg(not(feature = "ros2"))]
@@ -103,6 +103,11 @@ fn should_enable_talos_plugin(_app: &App) -> bool {
         .unwrap_or(false);
 
     !ros_capture_active || force_talos_capture
+}
+
+#[cfg(feature = "talos")]
+pub(crate) fn use_talos_local_capture() -> bool {
+    std::env::var("DAEDALUS_TALOS_LOCAL").is_ok_and(|value| value == "1")
 }
 
 fn main() {
@@ -138,6 +143,7 @@ fn main() {
     }
 
     app.add_plugins(RoboMasterPlugins)
+        .add_plugins(systems::patrol::PatrolPlugin)
         .add_plugins(MetalFxPlugin)
         .add_plugins(crate::scene::ScenePlugin)
         .add_plugins(ConfigPlugin)

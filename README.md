@@ -95,10 +95,23 @@
 * `/gimbal_pose`
 * `/odom_pose`
 * `/camera_pose`
+* `/simulator/capture_pose`：机器人视角下与彩色帧同时间戳的相机位姿（`map` 坐标系）
 
 **订阅话题**
 
-* `/armor_solver/cmd_gimbal`
+* `/rm_gimbal/cmd`
+* `/simulator/gimbal_cmd`：仿真连接器专用云台命令，只驱动转向
+* `/simulator/gimbal_setpoint`：EGAIM 仿真入口使用的 `sensor_msgs/msg/JointState`。`frame_id=map`，`yaw` 和 `pitch` 为绝对角，单位为弧度。空关节数组释放控制。
+
+### EGAIM 单机接入
+
+Bevy 与 EGAIM 在同一台 Linux 机器上运行时，可使用 Talos 传输 1440×1080 RGB8 图像，并保留 ROS2 姿态反馈和虚拟云台控制。加载 ROS2 Humble 及本仓库的 `rm_interfaces` 后，用 `cargo build --locked --release --features ros2 --bin daedalus` 构建 Bevy（默认功能包含 `talos`）。
+
+启动 Bevy 前设置 `DAEDALUS_TALOS_LOCAL=1`，由 Talos 独占彩色采集。创建用户可写的共享内存目录，例如 `/dev/shm/bevy-talos-$UID`，将 Bevy 的 `TALOS_SHM_DIR` 和 2027_EGAIM `simulator` 分支的 `ega_aim_simulation --talos-dir` 指向同一个目录。先启动 Bevy，再启动 EGAIM。两边使用相同的 `ROS_DOMAIN_ID`、`ROS_LOCALHOST_ONLY=1` 和 `RMW_IMPLEMENTATION=rmw_fastrtps_cpp`。保留预览窗口时，可在机器人视角按 F5 启用控制。
+
+### 固定场景预设
+
+点击画面右上角的 **Start patrol**，让蓝方步兵沿场地 X 轴左右往返。轨道以点击时的位置为中心，默认总行程 5 米（左右各 2.5 米），速度 1 米/秒。点击 **Stop patrol** 停止。可在 `config.toml` 的 `[patrol]` 下设置 `span_m` 与 `speed_mps`，下次启动往返时生效。
 
 ### Talos 共享内存接口
 

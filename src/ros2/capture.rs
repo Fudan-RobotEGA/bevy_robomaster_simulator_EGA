@@ -1,7 +1,7 @@
 //! ROS2 图像捕获实现
 
 use crate::capture::{
-    CameraFov, CaptureBundle, ImageHandle, compute_camera_intrinsics,
+    CameraFov, CaptureBundle, CaptureSource, ImageHandle, compute_camera_intrinsics,
     driver::{
         CaptureConfig, CaptureFrameId, CapturedFrame, CapturedFrameKind, GpuCaptureHandler,
         SnapshotAsync, SnapshotSync,
@@ -9,12 +9,16 @@ use crate::capture::{
     setup_capture_camera, setup_preview_window, sync_capture_camera,
 };
 use crate::ros2::image::compress_image;
-use crate::ros2::topic::{CameraInfoTopic, ImageCompressedTopic, ImageRawTopic, TopicPublisher};
+use crate::components::{CameraMode, Controlled, FollowingType, InfantryGimbal};
+use crate::ros2::topic::{
+    CameraInfoTopic, CapturePoseTopic, ImageCompressedTopic, ImageRawTopic, TopicPublisher,
+};
 use crate::systems::GameplaySystems;
 use bevy::ecs::world::DeferredWorld;
 use bevy::prelude::*;
-use bevy::render::{RenderApp, RenderSystems};
+use bevy::render::{Extract, ExtractSchedule, RenderApp, RenderSystems};
 use r2r::Clock;
+use r2r::geometry_msgs::msg::{Point, Pose, PoseStamped};
 use r2r::sensor_msgs::msg::{CameraInfo, RegionOfInterest};
 use r2r::std_msgs::msg::Header;
 use std::cell::RefCell;
@@ -22,6 +26,7 @@ use std::sync::{Arc, Mutex};
 
 struct RosSnapshotSync {
     stamp: RefCell<r2r::builtin_interfaces::msg::Time>,
+    pose: Option<Pose>,
 }
 
 impl SnapshotSync for RosSnapshotSync {
@@ -32,6 +37,7 @@ impl SnapshotSync for RosSnapshotSync {
     ) -> Box<dyn SnapshotAsync> {
         Box::new(RosSnapshot {
             stamp: self.stamp,
+            pose: self.pose,
             ctx: world.resource::<RosCaptureContextShared>().0.clone(),
         })
     }
@@ -39,6 +45,7 @@ impl SnapshotSync for RosSnapshotSync {
 
 struct RosSnapshot {
     stamp: RefCell<r2r::builtin_interfaces::msg::Time>,
+    pose: Option<Pose>,
     ctx: Arc<RosCaptureContext>,
 }
 
@@ -52,6 +59,15 @@ impl SnapshotAsync for RosSnapshot {
             stamp: self.stamp.take(),
             frame_id: "camera_optical_frame".to_string(),
         };
+        if let Some(pose) = self.pose.take() {
+            self.ctx.capture_pose.publish(PoseStamped {
+                header: Header {
+                    stamp: optical_frame_hdr.stamp.clone(),
+                    frame_id: "map".into(),
+                },
+                pose,
+            });
+        }
         self.ctx.camera_info.publish(ros_camera_info(
             optical_frame_hdr.clone(),
             frame.width,
@@ -59,25 +75,45 @@ impl SnapshotAsync for RosSnapshot {
             self.ctx.fov_y,
         ));
         if self.ctx.publish_compressed {
-            self.ctx.image_compressed.publish(compress_image(
-                optical_frame_hdr,
-                frame.width,
-                frame.height,
-                frame.data,
-            ));
+            self.ctx.image_compressed.publish_with(|| {
+                compress_image(
+                    optical_frame_hdr,
+                    frame.width,
+                    frame.height,
+                    frame.data,
+                )
+            });
         } else {
-            self.ctx.image_raw.publish(raw_image(
-                optical_frame_hdr,
-                frame.width,
-                frame.height,
-                frame.data,
-            ));
+            self.ctx.image_raw.publish_with(|| {
+                raw_image(
+                    optical_frame_hdr,
+                    frame.width,
+                    frame.height,
+                    frame.data,
+                )
+            });
         }
     }
 }
 
 #[derive(Default)]
 struct RosSnapshotCreator {}
+
+#[derive(Resource, Default)]
+struct CapturePose(Option<Transform>);
+
+fn extract_capture_pose(
+    source: Extract<Query<&Transform, With<CaptureSource>>>,
+    mode: Extract<Res<CameraMode>>,
+    gimbal: Extract<Query<Entity, (With<Controlled>, With<InfantryGimbal>)>>,
+    mut pose: ResMut<CapturePose>,
+) {
+    pose.0 = if mode.0 == FollowingType::Robot && gimbal.single().is_ok() {
+        source.single().ok().copied()
+    } else {
+        None
+    };
+}
 
 impl GpuCaptureHandler for RosSnapshotCreator {
     fn captured(
@@ -86,10 +122,22 @@ impl GpuCaptureHandler for RosSnapshotCreator {
         _frame_id: Option<CaptureFrameId>,
     ) -> Option<Box<dyn SnapshotSync>> {
         let clock = world.resource::<RosCaptureContext>();
+        let pose = world.resource::<CapturePose>().0.map(|transform| {
+            let tf = crate::ros2::prelude::transform(transform);
+            Pose {
+                position: Point {
+                    x: tf.translation.x,
+                    y: tf.translation.y,
+                    z: tf.translation.z,
+                },
+                orientation: tf.rotation,
+            }
+        });
         Some(Box::new(RosSnapshotSync {
             stamp: RefCell::new(Clock::to_builtin_time(
                 &clock.clock.lock().unwrap().get_now().unwrap(),
             )),
+            pose,
         }))
     }
 }
@@ -103,6 +151,7 @@ pub struct RosCaptureContext {
     pub fov_y: f32,
     pub publish_compressed: bool,
     pub camera_info: TopicPublisher<CameraInfoTopic>,
+    pub capture_pose: TopicPublisher<CapturePoseTopic>,
     pub image_raw: TopicPublisher<ImageRawTopic>,
     pub image_compressed: TopicPublisher<ImageCompressedTopic>,
 }
@@ -135,7 +184,9 @@ impl Plugin for RosCapturePlugin {
             );
         app.sub_app_mut(RenderApp)
             .insert_resource(RosCaptureContextShared(Arc::new(self.context.clone())))
-            .insert_resource(self.context.clone());
+            .insert_resource(self.context.clone())
+            .init_resource::<CapturePose>()
+            .add_systems(ExtractSchedule, extract_capture_pose);
     }
 }
 

@@ -268,9 +268,11 @@ impl LoadedMap {
             .spawn(
                 WorldAssetRoot(self.robots.infantry.clone()),
                 (
-                    Transform::from_xyz(1.0, 1.0, 1.0),
+                    // Center the X-axis patrol lane in front of the player's camera.
+                    Transform::from_xyz(0.0, 1.0, -6.0),
                     Infantry::new(Team::Blue, INFANTRY_THREE_CONFIG),
                     SlapperInfantry,
+                    crate::systems::patrol::PatrolRobot,
                 ),
             )
             .await?;

@@ -131,6 +131,7 @@ pub fn setup_vehicle(
         Option<&Controlled>,
         Option<&ActiveSlapper>,
     )>,
+    mut transforms: Query<&mut Transform>,
     sim_config: Res<SimulationConfig>,
 ) {
     let (root, infantry, is_local, is_active) = root_query
@@ -188,8 +189,16 @@ pub fn setup_vehicle(
     commands.entity(gimbal).insert(InfantryGimbal::default());
     if is_local {
         let q = query.of(gimbal).flatten();
+        let launch_offset = q.clone().exact("SHOT_DIRECTION").one().unwrap();
+        if let Ok(offset) = transforms.get(launch_offset) {
+            let camera_mount = offset.rotation * Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
+            let (_, pitch, _) = camera_mount.to_euler(EulerRot::YXZ);
+            if let Ok(mut transform) = transforms.get_mut(gimbal) {
+                transform.rotate_local_x(-pitch);
+            }
+        }
         commands
-            .entity(q.clone().exact("SHOT_DIRECTION").one().unwrap())
+            .entity(launch_offset)
             .insert(InfantryLaunchOffset);
         commands
             .entity(q.exact("CAM_DIRECTION").one().unwrap())

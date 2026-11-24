@@ -112,13 +112,21 @@ impl SnapshotAsync for TalosSnapshot {
         }
 
         if let Ok(mut publisher) = self.ctx.lock() {
-            let _ = publisher.try_publish_synchronized_image(
+            let published = publisher.try_publish_synchronized_image(
                 frame.data,
                 self.frame_seq,
                 self.timestamp_ns,
                 |publisher| {
                     publish_pose_data(publisher, self.frame_seq, self.timestamp_ns, &self.pose);
                 },
+            );
+            trace!(
+                target: "talos_capture_metrics",
+                seq = self.frame_seq,
+                published,
+                timestamp_ns = self.timestamp_ns,
+                age_us = now_ns().saturating_sub(self.timestamp_ns) / 1000,
+                "Talos capture"
             );
         }
     }

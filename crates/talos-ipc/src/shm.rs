@@ -36,7 +36,10 @@ impl From<io::Error> for ShmError {
 fn shm_path(name: &str) -> PathBuf {
     // 使用 /tmp 目录，移除开头的 '/'
     let clean_name = name.trim_start_matches('/');
-    PathBuf::from("/tmp").join(clean_name)
+    let directory = std::env::var_os("TALOS_SHM_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    directory.join(clean_name)
 }
 
 /// RAII 封装的共享内存区域

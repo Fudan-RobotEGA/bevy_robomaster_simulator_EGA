@@ -3,7 +3,7 @@ use bevy::prelude::*;
 use crate::components::{Controlled, InfantryChassis, InfantryGimbal, InfantryLaunchOffset};
 use crate::config::{GimbalAxisPidConfig, SimulationConfig};
 
-/// Absolute muzzle-frame aim target produced by an external auto-aim solver.
+/// Absolute world-frame aim target produced by an external auto-aim solver.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GimbalAimTarget {
     pub yaw: f32,
@@ -50,6 +50,7 @@ impl AxisPid {
 #[derive(Component, Clone, Copy, Debug)]
 pub struct GimbalAimTracker {
     target: GimbalAimTarget,
+    use_muzzle_forward: bool,
     yaw: AxisPid,
     pitch: AxisPid,
 }
@@ -58,6 +59,7 @@ impl GimbalAimTracker {
     pub fn new(target: GimbalAimTarget) -> Self {
         Self {
             target,
+            use_muzzle_forward: false,
             yaw: AxisPid::default(),
             pitch: AxisPid::default(),
         }
@@ -71,6 +73,12 @@ impl GimbalAimTracker {
     /// drives one continuous controller instead of restarting every message.
     pub fn retarget(&mut self, target: GimbalAimTarget) {
         self.target = target;
+        self.use_muzzle_forward = false;
+    }
+
+    pub(crate) fn retarget_muzzle_forward(&mut self, target: GimbalAimTarget) {
+        self.target = target;
+        self.use_muzzle_forward = true;
     }
 }
 
@@ -138,11 +146,20 @@ pub fn gimbal_pid_controls(
 
     // Error is measured on the muzzle, so chassis motion shows up as tracking error
     // instead of being cancelled out by a one-shot correction.
+    let target_rotation = tracker.target().rotation();
+    let muzzle_world = muzzle.rotation();
+    let target_rotation = if tracker.use_muzzle_forward {
+        // Match the desired direction without trying to control muzzle roll.
+        Quat::from_rotation_arc(muzzle_world * Vec3::Y, target_rotation * Vec3::NEG_Z)
+            * muzzle_world
+    } else {
+        target_rotation
+    };
     let error = tracking_error(
-        tracker.target().rotation(),
+        target_rotation,
         gimbal_transform.rotation,
         gimbal_global.rotation(),
-        muzzle.rotation(),
+        muzzle_world,
     );
     let (yaw_error, pitch_error) = (error.x, error.y);
     let pid = &config.vehicle.gimbal_pid;

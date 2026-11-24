@@ -4,6 +4,7 @@ mod controller;
 mod debug;
 mod gimbal_pid;
 mod input;
+pub mod patrol;
 mod projectile;
 mod uav;
 pub use camera::*;

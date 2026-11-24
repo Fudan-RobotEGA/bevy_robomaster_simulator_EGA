@@ -108,8 +108,15 @@ pub fn remote_vehicle_controls(
     time: Res<Time>,
     controller: Res<ControllerState>,
     config: Res<SimulationConfig>,
+    patrol: Res<super::patrol::PatrolState>,
     infantry: Single<
-        (&GlobalTransform, Forces, &Mass, &mut VehicleDynamic),
+        (
+            &GlobalTransform,
+            Forces,
+            &Mass,
+            &mut VehicleDynamic,
+            Has<super::patrol::PatrolRobot>,
+        ),
         (With<ActiveSlapper>, With<Infantry>, Without<Controlled>),
     >,
     chassis: Single<
@@ -126,7 +133,11 @@ pub fn remote_vehicle_controls(
     let input = controller.movement;
     let boost = controller.boost_multiplier();
 
-    let (infantry_global_transform, mut forces, &Mass(mass), mut dynamic) = infantry.into_inner();
+    let (infantry_global_transform, mut forces, &Mass(mass), mut dynamic, patrol_robot) =
+        infantry.into_inner();
+    if patrol_robot && patrol.active() {
+        return;
+    }
 
     let dt = time.delta_secs();
     dynamic.linear(
